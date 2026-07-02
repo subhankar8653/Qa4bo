@@ -56,6 +56,18 @@ class BunnyStreamClient:
             )
         resp.raise_for_status()
 
+    def create_video_from_url(self, source_url: str, title: str) -> str:
+        """Bunny 'Fetch' API — Bunny server khud URL se video download karega.
+        Local download/upload step bilkul bypass ho jaata hai."""
+        resp = requests.post(
+            f"{self.base_url}/videos/fetch",
+            headers={**self.headers, "content-type": "application/json"},
+            json={"url": source_url, "title": title},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()["guid"]
+
     # ---------- status ----------
 
     def get_video(self, video_id: str) -> dict:
