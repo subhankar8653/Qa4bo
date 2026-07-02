@@ -68,7 +68,9 @@ def build_quality_keyboard(job_id: str, selected: set) -> InlineKeyboardMarkup:
 
 
 def make_job_id(message: Message) -> str:
-    return f"{message.chat.id}:{message.id}"
+    # NOTE: must not contain ":" — callback_data below is itself ":"-delimited
+    # ("q:<job_id>:<action>"), so a colon inside job_id would break the split.
+    return f"{message.chat.id}_{message.id}"
 
 
 # ---------------------------------------------------------------------------
