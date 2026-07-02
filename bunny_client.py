@@ -11,13 +11,56 @@ Docs referenced:
 Video status codes (from Bunny docs):
   0 Created | 1 Uploaded | 2 Processing | 3 Transcoding
   4 Finished | 5 Error | 6 UploadFailed | 7 JitSegmenting | 8 JitPlaylistsCreated
+
+NOTE: this module is internal / developer-facing only. Nothing in here is ever
+shown to end users of the bot (see bot.py, jo saari user-facing strings ko
+generic "processing engine" language mein rakhta hai).
 """
 
+import os
 import time
 import requests
 
 STATUS_FINISHED = 4
 STATUS_FAILED = (5, 6)
+
+STATUS_LABELS = {
+    0: "queued",
+    1: "queued",
+    2: "processing",
+    3: "encoding",
+    4: "finished",
+    5: "failed",
+    6: "failed",
+    7: "finalizing",
+    8: "finalizing",
+}
+
+
+class _ProgressFileReader:
+    """Wraps a file object so every .read() call reports cumulative bytes
+    uploaded so far via on_progress(uploaded, total). Lets us stream a PUT
+    upload with progress instead of loading the whole file into memory."""
+
+    def __init__(self, file_obj, total_size, on_progress=None, chunk_size=1024 * 1024):
+        self._f = file_obj
+        self._total = total_size
+        self._uploaded = 0
+        self._on_progress = on_progress
+        self._chunk_size = chunk_size
+
+    def __len__(self):
+        # requests uses len() to set Content-Length when possible
+        return self._total
+
+    def read(self, size=-1):
+        size = self._chunk_size if size is None or size < 0 else size
+        chunk = self._f.read(size)
+        if chunk:
+            self._uploaded += len(chunk)
+            if self._on_progress:
+                self._on_progress(self._uploaded, self._total)
+        return chunk
 
 
 class BunnyStreamClient:
@@ -45,13 +88,17 @@ class BunnyStreamClient:
         resp.raise_for_status()
         return resp.json()["guid"]
 
-    def upload_video(self, video_id: str, file_path: str) -> None:
-        """Uploads the raw file bytes to a previously created video slot."""
+    def upload_video(self, video_id: str, file_path: str, on_progress=None) -> None:
+        """Uploads the raw file bytes to a previously created video slot.
+        on_progress(uploaded_bytes, total_bytes) is called after every chunk
+        read, so callers can drive a progress bar."""
+        total_size = os.path.getsize(file_path)
         with open(file_path, "rb") as f:
+            body = _ProgressFileReader(f, total_size, on_progress=on_progress) if on_progress else f
             resp = requests.put(
                 f"{self.base_url}/videos/{video_id}",
                 headers={**self.headers, "Content-Type": "application/octet-stream"},
-                data=f,
+                data=body,
                 timeout=None,
             )
         resp.raise_for_status()
@@ -84,7 +131,9 @@ class BunnyStreamClient:
 
     def wait_until_ready(self, video_id: str, poll_interval: int = 10,
                           timeout: int = 1800, on_progress=None) -> dict:
-        """Polls until status == Finished. Raises on failure/timeout."""
+        """Polls until status == Finished. Raises on failure/timeout.
+        on_progress(status_label, progress_pct) is called on every poll so
+        callers can drive an encoding progress bar."""
         elapsed = 0
         while elapsed < timeout:
             data = self.get_video(video_id)
@@ -92,17 +141,17 @@ class BunnyStreamClient:
             progress = data.get("encodeProgress", 0)
 
             if on_progress:
-                on_progress(status, progress)
+                on_progress(STATUS_LABELS.get(status, "processing"), progress)
 
             if status == STATUS_FINISHED:
                 return data
             if status in STATUS_FAILED:
-                raise RuntimeError(f"Bunny encoding failed (status={status})")
+                raise RuntimeError(f"encoding failed (status={status})")
 
             time.sleep(poll_interval)
             elapsed += poll_interval
 
-        raise TimeoutError("Bunny encoding did not finish within the timeout window")
+        raise TimeoutError("encoding did not finish within the timeout window")
 
     @staticmethod
     def available_resolutions(video_data: dict) -> list:
@@ -151,7 +200,7 @@ class BunnyStreamClient:
                 if attempt < max_retries - 1:
                     time.sleep(retry_delay)
 
-        raise last_error or RuntimeError("Download fail ho gaya, wajah pata nahi chali")
+        raise last_error or RuntimeError("download fail ho gaya, wajah pata nahi chali")
 
     def delete_video(self, video_id: str) -> None:
         requests.delete(f"{self.base_url}/videos/{video_id}", headers=self.headers, timeout=30)
