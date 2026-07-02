@@ -83,6 +83,24 @@ async def _run_job(client: Client, status_msg: Message, job: dict):
     selected = job["selected"]
     local_path = None
 
+    def schedule_edit(text: str):
+        """Background threads (run_in_executor callbacks) ke liye safe status
+        update. Pehle status_msg.edit_text(text) ko seedha run_coroutine_threadsafe
+        mein pass kiya jaata tha, jo occasionally 'TypeError: A coroutine object
+        is required' de kar poora job crash kar deta tha. Ab ek chota async
+        wrapper banate hain jo guaranteed real coroutine hai, aur andar try/except
+        se koi bhi edit-related error (MessageNotModified, FloodWait, etc.)
+        silently ignore ho jaata hai instead of killing the whole job."""
+        async def _do():
+            try:
+                await status_msg.edit_text(text)
+            except Exception:
+                pass
+        try:
+            asyncio.run_coroutine_threadsafe(_do(), loop)
+        except Exception:
+            pass
+
     try:
         if job["kind"] == "file":
             await status_msg.edit_text(f"Downloading  {progress_bar(0)}")
@@ -115,7 +133,7 @@ async def _run_job(client: Client, status_msg: Message, job: dict):
                 last_edit["t"] = now
                 pct = int(uploaded * 100 / total) if total else 0
                 text = f"Preparing  {progress_bar(pct)}"
-                asyncio.run_coroutine_threadsafe(status_msg.edit_text(text), loop)
+                schedule_edit(text)
 
             await loop.run_in_executor(
                 None, lambda: engine.upload_video(video_id, local_path, on_progress=up_progress)
@@ -141,7 +159,7 @@ async def _run_job(client: Client, status_msg: Message, job: dict):
                 return
             last_enc["t"] = now
             text = f"Encoding  {progress_bar(int(pct))}"
-            asyncio.run_coroutine_threadsafe(status_msg.edit_text(text), loop)
+            schedule_edit(text)
 
         video_data = await loop.run_in_executor(
             None,
@@ -179,7 +197,7 @@ async def _run_job(client: Client, status_msg: Message, job: dict):
                     last_edit["t"] = now
                     pct = int(downloaded * 100 / total) if total else 0
                     text = f"{r}  Downloading  {progress_bar(pct)}"
-                    asyncio.run_coroutine_threadsafe(status_msg.edit_text(text), loop)
+                    schedule_edit(text)
                 return cb
 
             async def upload_progress(current, total, r=res):
