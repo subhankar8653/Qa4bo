@@ -30,53 +30,58 @@ bunny = BunnyStreamClient(BUNNY_LIBRARY_ID, BUNNY_API_KEY, BUNNY_PULL_ZONE)
 
 
 async def _wait_and_send_qualities(message: Message, status_msg: Message, video_id: str):
-    """Bunny encoding complete hone ka wait karta hai, phir har quality
-    download karke isi chat mein wapas bhej deta hai."""
+    """Bunny pe encoding chalte hi poll karta rehta hai, aur jaise hi koi
+    NAYA resolution 'available' list mein aata hai use turant bhej deta hai —
+    baaki resolutions ka poora encoding complete hone ka wait nahi karta."""
     loop = asyncio.get_event_loop()
+    sent = set()
+    elapsed = 0
 
-    def progress_cb(status, progress):
+    while True:
+        video_data = await loop.run_in_executor(None, bunny.get_video, video_id)
+        status = video_data.get("status")
+        progress = video_data.get("encodeProgress", 0)
         log.info("video %s status=%s progress=%s%%", video_id, status, progress)
 
-    video_data = await loop.run_in_executor(
-        None,
-        lambda: bunny.wait_until_ready(
-            video_id,
-            poll_interval=POLL_INTERVAL_SECONDS,
-            timeout=ENCODE_TIMEOUT_SECONDS,
-            on_progress=progress_cb,
-        ),
-    )
+        resolutions = bunny.available_resolutions(video_data)
+        if WANTED_RESOLUTIONS:
+            resolutions = [r for r in resolutions if r in WANTED_RESOLUTIONS]
 
-    resolutions = bunny.available_resolutions(video_data)
-    if WANTED_RESOLUTIONS:
-        resolutions = [r for r in resolutions if r in WANTED_RESOLUTIONS]
+        new_ones = [r for r in resolutions if r not in sent]
+        if new_ones:
+            await status_msg.edit_text(
+                f"Naya ready: {', '.join(new_ones)} — bhej raha hoon..."
+            )
+            for res in new_ones:
+                dest = os.path.join(DOWNLOAD_DIR, f"{video_id}_{res}.mp4")
+                try:
+                    await loop.run_in_executor(
+                        None, lambda r=res, d=dest: bunny.download_resolution(video_id, r, d)
+                    )
+                    await message.reply_video(dest, caption=f"Quality: {res}")
+                    sent.add(res)
+                finally:
+                    if os.path.exists(dest):
+                        os.remove(dest)
 
-    if not resolutions:
+        if status == 4:  # Finished — baaki koi resolution aana nahi bacha
+            break
+        if status in (5, 6):  # Error / UploadFailed
+            raise RuntimeError(f"Bunny encoding failed (status={status})")
+
+        if elapsed >= ENCODE_TIMEOUT_SECONDS:
+            raise TimeoutError("Bunny encoding timeout ho gaya")
+
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+        elapsed += POLL_INTERVAL_SECONDS
+
+    if not sent:
         await status_msg.edit_text(
             "Koi resolution nahi mila. Check karo ki library ki Encoding "
             "settings mein 'MP4 Fallback' ON hai ya nahi."
         )
-        if DELETE_FROM_BUNNY_AFTER_SEND:
-            bunny.delete_video(video_id)
-        return
-
-    await status_msg.edit_text(
-        f"Ready! {len(resolutions)} quality mil gayi ({', '.join(resolutions)}). "
-        f"Bhej raha hoon ek-ek karke..."
-    )
-
-    for res in resolutions:
-        dest = os.path.join(DOWNLOAD_DIR, f"{video_id}_{res}.mp4")
-        try:
-            await loop.run_in_executor(
-                None, lambda r=res, d=dest: bunny.download_resolution(video_id, r, d)
-            )
-            await message.reply_video(dest, caption=f"Quality: {res}")
-        finally:
-            if os.path.exists(dest):
-                os.remove(dest)
-
-    await status_msg.edit_text("Sab qualities bhej di gayi \u2705")
+    else:
+        await status_msg.edit_text("Sab qualities bhej di gayi \u2705")
 
     if DELETE_FROM_BUNNY_AFTER_SEND:
         bunny.delete_video(video_id)
