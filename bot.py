@@ -31,89 +31,82 @@ bunny = BunnyStreamClient(BUNNY_LIBRARY_ID, BUNNY_API_KEY, BUNNY_PULL_ZONE)
 
 
 async def _wait_and_send_qualities(message: Message, status_msg: Message, video_id: str):
-    """Bunny pe encoding chalte hi poll karta rehta hai, aur jaise hi koi
-    NAYA resolution 'available' list mein aata hai use turant bhej deta hai —
-    baaki resolutions ka poora encoding complete hone ka wait nahi karta."""
+    """Bunny ka poora encoding (status Finished) complete hone tak wait karta hai,
+    phir har resolution ek-ek karke download karke isi chat mein bhej deta hai —
+    isse CDN ko har mp4 file propagate hone ka poora time mil jaata hai."""
     loop = asyncio.get_event_loop()
-    sent = set()
-    elapsed = 0
 
-    while True:
-        video_data = await loop.run_in_executor(None, bunny.get_video, video_id)
-        status = video_data.get("status")
-        progress = video_data.get("encodeProgress", 0)
+    def progress_cb(status, progress):
         log.info("video %s status=%s progress=%s%%", video_id, status, progress)
 
-        resolutions = bunny.available_resolutions(video_data)
-        if WANTED_RESOLUTIONS:
-            resolutions = [r for r in resolutions if r in WANTED_RESOLUTIONS]
+    video_data = await loop.run_in_executor(
+        None,
+        lambda: bunny.wait_until_ready(
+            video_id,
+            poll_interval=POLL_INTERVAL_SECONDS,
+            timeout=ENCODE_TIMEOUT_SECONDS,
+            on_progress=progress_cb,
+        ),
+    )
 
-        new_ones = [r for r in resolutions if r not in sent]
-        if new_ones:
-            for res in new_ones:
-                dest = os.path.join(DOWNLOAD_DIR, f"{video_id}_{res}.mp4")
-                last_edit = {"t": 0.0}
+    resolutions = bunny.available_resolutions(video_data)
+    if WANTED_RESOLUTIONS:
+        resolutions = [r for r in resolutions if r in WANTED_RESOLUTIONS]
 
-                def make_dl_progress(r=res):
-                    def cb(downloaded, total):
-                        now = time.time()
-                        if now - last_edit["t"] < 3:
-                            return
-                        last_edit["t"] = now
-                        pct = int(downloaded * 100 / total) if total else 0
-                        text = f"{r} download ho raha hai bunny se... {pct}%"
-                        asyncio.run_coroutine_threadsafe(
-                            status_msg.edit_text(text), loop
-                        )
-                    return cb
-
-                async def upload_progress(current, total, r=res):
-                    now = time.time()
-                    if now - last_edit["t"] < 3:
-                        return
-                    last_edit["t"] = now
-                    pct = int(current * 100 / total) if total else 0
-                    try:
-                        await status_msg.edit_text(f"{r} Telegram pe upload ho raha hai... {pct}%")
-                    except Exception:
-                        pass
-
-                try:
-                    await loop.run_in_executor(
-                        None,
-                        lambda r=res, d=dest, cb=make_dl_progress(): bunny.download_resolution(
-                            video_id, r, d, on_progress=cb
-                        ),
-                    )
-                    last_edit["t"] = 0.0
-                    await message.reply_video(
-                        dest, caption=f"Quality: {res}", progress=upload_progress
-                    )
-                    sent.add(res)
-                except Exception as e:
-                    log.warning("resolution %s abhi ready nahi (%s), agla poll try karega", res, e)
-                finally:
-                    if os.path.exists(dest):
-                        os.remove(dest)
-
-        if status == 4:  # Finished — baaki koi resolution aana nahi bacha
-            break
-        if status in (5, 6):  # Error / UploadFailed
-            raise RuntimeError(f"Bunny encoding failed (status={status})")
-
-        if elapsed >= ENCODE_TIMEOUT_SECONDS:
-            raise TimeoutError("Bunny encoding timeout ho gaya")
-
-        await asyncio.sleep(POLL_INTERVAL_SECONDS)
-        elapsed += POLL_INTERVAL_SECONDS
-
-    if not sent:
+    if not resolutions:
         await status_msg.edit_text(
             "Koi resolution nahi mila. Check karo ki library ki Encoding "
             "settings mein 'MP4 Fallback' ON hai ya nahi."
         )
-    else:
-        await status_msg.edit_text("Sab qualities bhej di gayi \u2705")
+        if DELETE_FROM_BUNNY_AFTER_SEND:
+            bunny.delete_video(video_id)
+        return
+
+    await status_msg.edit_text(
+        f"Ready! {len(resolutions)} quality mil gayi ({', '.join(resolutions)}). "
+        f"Bhej raha hoon ek-ek karke..."
+    )
+
+    for res in resolutions:
+        dest = os.path.join(DOWNLOAD_DIR, f"{video_id}_{res}.mp4")
+        last_edit = {"t": 0.0}
+
+        def make_dl_progress(r=res):
+            def cb(downloaded, total):
+                now = time.time()
+                if now - last_edit["t"] < 3:
+                    return
+                last_edit["t"] = now
+                pct = int(downloaded * 100 / total) if total else 0
+                text = f"{r} download ho raha hai bunny se... {pct}%"
+                asyncio.run_coroutine_threadsafe(status_msg.edit_text(text), loop)
+            return cb
+
+        async def upload_progress(current, total, r=res):
+            now = time.time()
+            if now - last_edit["t"] < 3:
+                return
+            last_edit["t"] = now
+            pct = int(current * 100 / total) if total else 0
+            try:
+                await status_msg.edit_text(f"{r} Telegram pe upload ho raha hai... {pct}%")
+            except Exception:
+                pass
+
+        try:
+            await loop.run_in_executor(
+                None,
+                lambda r=res, d=dest, cb=make_dl_progress(): bunny.download_resolution(
+                    video_id, r, d, on_progress=cb
+                ),
+            )
+            last_edit["t"] = 0.0
+            await message.reply_video(dest, caption=f"Quality: {res}", progress=upload_progress)
+        finally:
+            if os.path.exists(dest):
+                os.remove(dest)
+
+    await status_msg.edit_text("Sab qualities bhej di gayi \u2705")
 
     if DELETE_FROM_BUNNY_AFTER_SEND:
         bunny.delete_video(video_id)
