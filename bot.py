@@ -100,6 +100,12 @@ async def handle_url(client: Client, message: Message):
     """FileToLink (ya kisi bhi public) link se seedha Bunny fetch karega —
     local download/upload step yahan skip ho jaata hai, isliye ye fast route hai."""
     source_url = message.text.strip()
+    # Kabhi kabhi FileToLink link mein double slash aa jaata hai (base_url//dl/..),
+    # jisse Bunny 422 de deta hai — path ka double-slash normalize kar dete hain.
+    if "://" in source_url:
+        scheme, rest = source_url.split("://", 1)
+        rest = rest.replace("//", "/")
+        source_url = f"{scheme}://{rest}"
     status_msg = await message.reply_text("Bunny ko bol raha hoon URL se fetch kare...")
 
     try:

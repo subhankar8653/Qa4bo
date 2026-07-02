@@ -57,16 +57,19 @@ class BunnyStreamClient:
         resp.raise_for_status()
 
     def create_video_from_url(self, source_url: str, title: str) -> str:
-        """Bunny 'Fetch' API — Bunny server khud URL se video download karega.
-        Local download/upload step bilkul bypass ho jaata hai."""
+        """Pehle ek video-slot banata hai (create_video se guid milta hai),
+        phir usi guid pe Bunny ka per-video Fetch API call karta hai —
+        Bunny server khud us URL se download karega, local download bypass ho jaata hai.
+        (Library-level /videos/fetch endpoint guid return nahi karta, isliye ye do-step tarika chahiye.)"""
+        video_id = self.create_video(title)
         resp = requests.post(
-            f"{self.base_url}/videos/fetch",
+            f"{self.base_url}/videos/{video_id}/fetch",
             headers={**self.headers, "content-type": "application/json"},
-            json={"url": source_url, "title": title},
-            timeout=30,
+            json={"url": source_url},
+            timeout=60,
         )
         resp.raise_for_status()
-        return resp.json()["guid"]
+        return video_id
 
     # ---------- status ----------
 
