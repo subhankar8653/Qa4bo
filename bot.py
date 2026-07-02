@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import time
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
@@ -49,17 +50,48 @@ async def _wait_and_send_qualities(message: Message, status_msg: Message, video_
 
         new_ones = [r for r in resolutions if r not in sent]
         if new_ones:
-            await status_msg.edit_text(
-                f"Naya ready: {', '.join(new_ones)} — bhej raha hoon..."
-            )
             for res in new_ones:
                 dest = os.path.join(DOWNLOAD_DIR, f"{video_id}_{res}.mp4")
+                last_edit = {"t": 0.0}
+
+                def make_dl_progress(r=res):
+                    def cb(downloaded, total):
+                        now = time.time()
+                        if now - last_edit["t"] < 3:
+                            return
+                        last_edit["t"] = now
+                        pct = int(downloaded * 100 / total) if total else 0
+                        text = f"{r} download ho raha hai bunny se... {pct}%"
+                        asyncio.run_coroutine_threadsafe(
+                            status_msg.edit_text(text), loop
+                        )
+                    return cb
+
+                async def upload_progress(current, total, r=res):
+                    now = time.time()
+                    if now - last_edit["t"] < 3:
+                        return
+                    last_edit["t"] = now
+                    pct = int(current * 100 / total) if total else 0
+                    try:
+                        await status_msg.edit_text(f"{r} Telegram pe upload ho raha hai... {pct}%")
+                    except Exception:
+                        pass
+
                 try:
                     await loop.run_in_executor(
-                        None, lambda r=res, d=dest: bunny.download_resolution(video_id, r, d)
+                        None,
+                        lambda r=res, d=dest, cb=make_dl_progress(): bunny.download_resolution(
+                            video_id, r, d, on_progress=cb
+                        ),
                     )
-                    await message.reply_video(dest, caption=f"Quality: {res}")
+                    last_edit["t"] = 0.0
+                    await message.reply_video(
+                        dest, caption=f"Quality: {res}", progress=upload_progress
+                    )
                     sent.add(res)
+                except Exception as e:
+                    log.warning("resolution %s abhi ready nahi (%s), agla poll try karega", res, e)
                 finally:
                     if os.path.exists(dest):
                         os.remove(dest)

@@ -116,15 +116,42 @@ class BunnyStreamClient:
         unless only a higher single resolution is enabled in the library."""
         return f"https://{self.pull_zone}/{video_id}/play_{resolution}.mp4"
 
-    def download_resolution(self, video_id: str, resolution: str, dest_path: str) -> str:
+    def download_resolution(self, video_id: str, resolution: str, dest_path: str,
+                             on_progress=None, max_retries: int = 6, retry_delay: int = 5) -> str:
+        """CDN pe kabhi kabhi file 'availableResolutions' mein aane ke turant baad
+        propagate hone mein kuch second lagte hain (404 aata hai) — isliye
+        thodi der retry karte hain. on_progress(downloaded_bytes, total_bytes) callback
+        har chunk ke baad call hota hai (progress bar dikhane ke liye)."""
         url = self.mp4_url(video_id, resolution)
-        with requests.get(url, stream=True, timeout=60) as r:
-            r.raise_for_status()
-            with open(dest_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-        return dest_path
+        last_error = None
+
+        for attempt in range(max_retries):
+            try:
+                with requests.get(url, stream=True, timeout=60) as r:
+                    if r.status_code == 404 and attempt < max_retries - 1:
+                        last_error = requests.exceptions.HTTPError(
+                            f"404 (CDN propagation ka wait, attempt {attempt + 1}/{max_retries})"
+                        )
+                        time.sleep(retry_delay)
+                        continue
+
+                    r.raise_for_status()
+                    total = int(r.headers.get("content-length", 0))
+                    downloaded = 0
+                    with open(dest_path, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=1024 * 1024):
+                            if chunk:
+                                f.write(chunk)
+                                downloaded += len(chunk)
+                                if on_progress:
+                                    on_progress(downloaded, total)
+                    return dest_path
+            except requests.exceptions.HTTPError as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+
+        raise last_error or RuntimeError("Download fail ho gaya, wajah pata nahi chali")
 
     def delete_video(self, video_id: str) -> None:
         requests.delete(f"{self.base_url}/videos/{video_id}", headers=self.headers, timeout=30)
