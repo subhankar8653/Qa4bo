@@ -71,7 +71,6 @@ async def health(request: web.Request):
 
 
 @routes.get("/dl/{file_uid}")
-@routes.head("/dl/{file_uid}")
 async def stream_handler(request: web.Request):
     file_uid = request.match_info["file_uid"]
     rec = await get_file(file_uid)
