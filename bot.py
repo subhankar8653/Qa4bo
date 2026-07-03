@@ -4,7 +4,7 @@ import logging
 import time
 from typing import Dict
 
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
 from config import (
@@ -13,8 +13,11 @@ from config import (
     DOWNLOAD_DIR,
     DELETE_FROM_BUNNY_AFTER_SEND,
     POLL_INTERVAL_SECONDS, ENCODE_TIMEOUT_SECONDS,
+    BASE_URL, PORT,
 )
 from bunny_client import BunnyStreamClient
+from db import ensure_indexes, save_file
+from streamer import start_web_server
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("quality_changer_bot")
@@ -82,6 +85,7 @@ async def _run_job(client: Client, status_msg: Message, job: dict):
     origin_message: Message = job["message"]
     selected = job["selected"]
     local_path = None
+    video_id = None
 
     def schedule_edit(text: str):
         """Background threads (run_in_executor callbacks) ke liye safe status
@@ -102,53 +106,18 @@ async def _run_job(client: Client, status_msg: Message, job: dict):
             pass
 
     try:
-        if job["kind"] == "file":
-            await status_msg.edit_text(f"Downloading  {progress_bar(0)}")
-            last_edit = {"t": 0.0}
-
-            async def dl_progress(current, total):
-                now = time.time()
-                if now - last_edit["t"] < 2 and current != total:
-                    return
-                last_edit["t"] = now
-                pct = int(current * 100 / total) if total else 0
-                try:
-                    await status_msg.edit_text(f"Downloading  {progress_bar(pct)}")
-                except Exception:
-                    pass
-
-            local_path = await origin_message.download(
-                file_name=f"{DOWNLOAD_DIR}/", progress=dl_progress
-            )
-
-            title = os.path.basename(local_path)
-            video_id = engine.create_video(title)
-
-            last_edit["t"] = 0.0
-
-            def up_progress(uploaded, total):
-                now = time.time()
-                if now - last_edit["t"] < 2 and uploaded != total:
-                    return
-                last_edit["t"] = now
-                pct = int(uploaded * 100 / total) if total else 0
-                text = f"Preparing  {progress_bar(pct)}"
-                schedule_edit(text)
-
-            await loop.run_in_executor(
-                None, lambda: engine.upload_video(video_id, local_path, on_progress=up_progress)
-            )
-
-            os.remove(local_path)
-            local_path = None
-
-        else:  # url
-            source_url = job["source_url"]
-            title = os.path.basename(source_url.split("?")[0]) or "video"
-            await status_msg.edit_text(f"Preparing  {progress_bar(0)}")
-            video_id = await loop.run_in_executor(
-                None, lambda: engine.create_video_from_url(source_url, title)
-            )
+        # Ab har job ek source_url ke saath aata hai — chahe user ne seedha
+        # http(s) link bheja ho, ya video/document bheja ho (jiske liye
+        # handle_video pehle hamare apne streaming server se ek link bana
+        # chuka hai). Dono cases mein Bunny us link se seedha video fetch
+        # karta hai (create_video_from_url), koi alag download+upload branch
+        # ab zaroorat nahi.
+        source_url = job["source_url"]
+        title = job.get("title") or os.path.basename(source_url.split("?")[0]) or "video"
+        await status_msg.edit_text(f"Preparing  {progress_bar(0)}")
+        video_id = await loop.run_in_executor(
+            None, lambda: engine.create_video_from_url(source_url, title)
+        )
 
         # ---- encode / wait ----
         last_enc = {"t": 0.0}
@@ -267,7 +236,6 @@ async def handle_url(client: Client, message: Message):
 
     job_id = make_job_id(message)
     PENDING_JOBS[job_id] = {
-        "kind": "url",
         "source_url": source_url,
         "message": message,
         "selected": set(),
@@ -281,14 +249,50 @@ async def handle_url(client: Client, message: Message):
 
 @app.on_message(filters.video | filters.document)
 async def handle_video(client: Client, message: Message):
+    media = message.video or message.document
+    if media is None:
+        return
+
+    if not BASE_URL:
+        await message.reply_text(
+            "BASE_URL config nahi hai, isliye file ka link nahi bana paunga.\n"
+            "Railway pe domain generate karo aur BASE_URL env var mein daalo "
+            "(ya RAILWAY_PUBLIC_DOMAIN already set ho to bas redeploy karo)."
+        )
+        return
+
+    file_name = getattr(media, "file_name", None) or f"{media.file_unique_id}.mp4"
+    status_msg = await message.reply_text("Link bana raha hoon...")
+
+    try:
+        await save_file(
+            unique_id=media.file_unique_id,
+            file_id=media.file_id,
+            file_name=file_name,
+            file_size=media.file_size,
+            mime_type=getattr(media, "mime_type", None) or "video/mp4",
+            chat_id=message.chat.id,
+            message_id=message.id,
+        )
+    except Exception:
+        log.exception("save_file failed")
+        await status_msg.edit_text(
+            "Link nahi ban paya — MongoDB connection check karo (MONGO_URI)."
+        )
+        return
+
+    link = f"{BASE_URL}/dl/{media.file_unique_id}"
+
     job_id = make_job_id(message)
     PENDING_JOBS[job_id] = {
-        "kind": "file",
+        "source_url": link,
+        "title": file_name,
         "message": message,
         "selected": set(),
     }
 
-    await message.reply_text(
+    await status_msg.edit_text(
+        f"Link ban gaya: {link}\n\n"
         "Kaunsi quality chahiye? Select karo aur Start dabao:",
         reply_markup=build_quality_keyboard(job_id, set()),
     )
@@ -349,6 +353,20 @@ async def on_quality_callback(client: Client, cq: CallbackQuery):
     await cq.answer()
 
 
+async def _main():
+    await app.start()
+    await ensure_indexes()
+    await start_web_server(app, PORT)
+    log.info("Bot + streaming server dono chalu ho gaye. BASE_URL=%s PORT=%s", BASE_URL, PORT)
+    if not BASE_URL:
+        log.warning(
+            "BASE_URL set nahi hai — file/video se link nahi banega jab tak "
+            "ye config na ho (sirf text URL wala flow kaam karega)."
+        )
+    await idle()
+    await app.stop()
+
+
 if __name__ == "__main__":
     log.info("Bot starting...")
-    app.run()
+    app.run(_main())
